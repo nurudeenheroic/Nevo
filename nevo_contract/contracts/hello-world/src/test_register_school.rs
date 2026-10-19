@@ -32,6 +32,15 @@ fn test_admin_registers_school() {
     assert_eq!(client.get_school_metadata(&school), metadata_hash);
 }
 
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #14)")]
+fn test_get_school_metadata_unregistered_panics() {
+    let env = Env::default();
+    let (client, _) = setup(&env);
+    let unregistered_school = Address::generate(&env);
+    client.get_school_metadata(&unregistered_school);
+}
+
 /// Registration is authorized against the stored root admin address.
 #[test]
 fn test_register_school_requires_admin_auth() {
@@ -112,7 +121,7 @@ fn test_reregister_updates_metadata_hash() {
 
 /// Registration fails cleanly when no admin has been configured.
 #[test]
-#[should_panic(expected = "Admin not set")]
+#[should_panic(expected = "Error(Contract, #9)")]
 fn test_register_school_without_admin_panics() {
     let env = Env::default();
     env.mock_all_auths();

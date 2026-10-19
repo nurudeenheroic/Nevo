@@ -326,9 +326,9 @@ fn test_valid_admin_requests_emergency_withdrawal() {
     assert!(has_request, "Emergency withdrawal request should be stored");
 }
 
-/// Test 2: Non-admin account calling request_emergency_withdraw gets Auth Error
+/// Test 2: Non-admin account calling request_emergency_withdraw gets UnauthorizedAdmin
 #[test]
-#[should_panic(expected = "Error(Auth, InvalidAction)")]
+#[should_panic(expected = "Error(Contract, #3)")]
 fn test_non_admin_request_emergency_withdrawal_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -349,7 +349,7 @@ fn test_non_admin_request_emergency_withdrawal_fails() {
         &100_000u64,
     );
 
-    // Non-admin should fail with Auth Error
+    // Non-admin should fail with UnauthorizedAdmin
     client.request_emergency_withdraw(&non_admin, &pool_id, &token, &100_000_000i128);
 }
 
@@ -722,15 +722,21 @@ fn test_setup_application_milestones_empty_panics() {
 
     let creator = Address::generate(&env);
     let student = Address::generate(&env);
-    let pool_id = client.create_pool(
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[1u8; 32]));
+    let pool_id = client.create_pool_for_school(
         &creator,
         &String::from_str(&env, "Milestone Pool"),
         &String::from_str(&env, "Test"),
         &1_000_000_000u128,
+        &school,
         &100_000u64,
     );
 
     client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+    client.approve_application(&pool_id, &school, &student, &true);
     client.setup_application_milestones(&pool_id, &student, &Vec::new(&env));
 }
 
@@ -745,11 +751,16 @@ fn test_setup_application_milestones_total_mismatch_panics() {
 
     let creator = Address::generate(&env);
     let student = Address::generate(&env);
-    let pool_id = client.create_pool(
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[2u8; 32]));
+    let pool_id = client.create_pool_for_school(
         &creator,
         &String::from_str(&env, "Milestone Pool"),
         &String::from_str(&env, "Test"),
         &1_000_000_000u128,
+        &school,
         &100_000u64,
     );
 
@@ -758,6 +769,7 @@ fn test_setup_application_milestones_total_mismatch_panics() {
         [Milestone { amount: 100_000_000u128 }, Milestone { amount: 200_000_000u128 }],
     );
     client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+    client.approve_application(&pool_id, &school, &student, &true);
     client.setup_application_milestones(&pool_id, &student, &milestones);
 }
 
@@ -772,11 +784,16 @@ fn test_setup_application_milestones_overflow_panics() {
 
     let creator = Address::generate(&env);
     let student = Address::generate(&env);
-    let pool_id = client.create_pool(
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[3u8; 32]));
+    let pool_id = client.create_pool_for_school(
         &creator,
         &String::from_str(&env, "Milestone Pool"),
         &String::from_str(&env, "Test"),
         &1_000_000_000u128,
+        &school,
         &100_000u64,
     );
 
@@ -785,12 +802,168 @@ fn test_setup_application_milestones_overflow_panics() {
         [Milestone { amount: u128::MAX }, Milestone { amount: 1u128 }],
     );
     client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+    client.approve_application(&pool_id, &school, &student, &true);
     client.setup_application_milestones(&pool_id, &student, &milestones);
 }
 
 /// Test 4: Milestones summing to the pool goal are stored and read back correctly
 #[test]
 fn test_setup_and_get_milestones_round_trip() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[4u8; 32]));
+    let pool_id = client.create_pool_for_school(
+        &creator,
+        &String::from_str(&env, "Milestone Pool"),
+        &String::from_str(&env, "Test"),
+        &1_000_000_000u128,
+        &school,
+        &100_000u64,
+    );
+
+    let milestones = Vec::from_array(
+        &env,
+        [Milestone { amount: 400_000_000u128 }, Milestone { amount: 600_000_000u128 }],
+    );
+    client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+    client.approve_application(&pool_id, &school, &student, &true);
+    client.setup_application_milestones(&pool_id, &student, &milestones);
+
+    let stored = client.get_milestones(&pool_id, &student);
+    assert_eq!(stored, milestones);
+}
+
+// ============= ISSUE #1345: SETUP_APPLICATION_MILESTONES VALIDATION =============
+//
+// Items 1-3 of #1345 largely overlap with the #942 tests immediately above:
+//   - "doesn't exist" (never applied)   -> test_setup_application_milestones_without_application_panics (test.rs)
+//   - "empty milestone list disallowed" -> test_setup_application_milestones_empty_panics
+//   - amount-mismatch panics            -> test_setup_application_milestones_total_mismatch_panics
+// The #942 tests above (and their sibling in test.rs) were updated to route
+// through create_pool_for_school + apply_to_pool + approve_application,
+// since setup_application_milestones now requires an Approved application
+// (see below) rather than merely a submitted one.
+//
+// Three genuinely new behaviors are covered below:
+//   - item 1: only the student's own auth authorizes the call -- the
+//     pre-existing tests all used mock_all_auths, which can't distinguish
+//     an authorized caller from an impostor.
+//   - item 2 ("isn't approved"): setup_application_milestones did NOT check
+//     application status at all -- a student whose application was still
+//     Pending (or explicitly Rejected) could configure milestones. Fixed in
+//     lib.rs to require APPLICATION_STATUS_APPROVED, mirroring the identical
+//     check already enforced by claim_funds. Tested below.
+//   - item 5: re-configuration is unguarded and silently overwrites.
+//
+// NOTE on item 4 ("exceeds approved allocation"): NOT implemented, and
+// deliberately left that way. `Application.approved_amount` is a different,
+// unrelated concept -- it's lazily created inside claim_funds on a student's
+// *first* claim, initialized to pool.collected at that moment. It doesn't
+// exist yet at the point milestones are normally configured (before any
+// claims), so there is nothing meaningful to check against without a larger
+// design change (e.g. a real per-student allocation cap set at approval
+// time). No test was written for this; it remains a documented gap.
+
+/// Test 5 (Issue #1345, item 1): only the student named in the application
+/// may configure its own milestones. Providing a valid auth entry for a
+/// different address must be rejected even though `student` is passed
+/// explicitly as an argument -- `setup_application_milestones` enforces
+/// `student.require_auth()`, not "whoever calls this function."
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_setup_application_milestones_unauthorized_caller_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let student = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Milestone Pool"),
+        &String::from_str(&env, "Test"),
+        &1_000_000_000u128,
+        &100_000u64,
+    );
+    client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+
+    let milestones = Vec::from_array(&env, [Milestone { amount: 1_000_000_000u128 }]);
+
+    // Auth entry is signed by `impostor`, not `student` -- must fail.
+    client
+        .mock_auths(&[MockAuth {
+            address: &impostor,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "setup_application_milestones",
+                args: (&pool_id, &student, &milestones).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .setup_application_milestones(&pool_id, &student, &milestones);
+}
+
+/// Test 6 (Issue #1345, item 5): calling setup_application_milestones a
+/// second time for the same (pool_id, student) is NOT rejected. There is no
+/// guard against re-configuration (unlike, e.g., apply_to_pool's
+/// DuplicateApplication check) -- the second call silently overwrites the
+/// first milestone list. This documents that actual, current behavior.
+#[test]
+fn test_setup_application_milestones_reconfiguration_overwrites() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    let goal = 1_000_000_000u128;
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[5u8; 32]));
+    let pool_id = client.create_pool_for_school(
+        &creator,
+        &String::from_str(&env, "Milestone Pool"),
+        &String::from_str(&env, "Test"),
+        &goal,
+        &school,
+        &100_000u64,
+    );
+    client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+    client.approve_application(&pool_id, &school, &student, &true);
+
+    let first = Vec::from_array(
+        &env,
+        [Milestone { amount: 400_000_000u128 }, Milestone { amount: 600_000_000u128 }],
+    );
+    client.setup_application_milestones(&pool_id, &student, &first);
+    assert_eq!(client.get_milestones(&pool_id, &student), first);
+
+    let second = Vec::from_array(&env, [Milestone { amount: 1_000_000_000u128 }]);
+    client.setup_application_milestones(&pool_id, &student, &second);
+
+    let stored = client.get_milestones(&pool_id, &student);
+    assert_eq!(stored, second, "second call overwrites the first milestone list");
+    assert_ne!(stored, first, "the original milestone list is no longer retrievable");
+}
+
+/// Test 7 (Issue #1345, item 2): a student who has applied but whose
+/// application is still Pending (never approved) cannot configure
+/// milestones.
+#[test]
+#[should_panic(expected = "Application is not approved")]
+fn test_setup_application_milestones_pending_application_fails() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(Contract, ());
@@ -806,15 +979,43 @@ fn test_setup_and_get_milestones_round_trip() {
         &100_000u64,
     );
 
-    let milestones = Vec::from_array(
-        &env,
-        [Milestone { amount: 400_000_000u128 }, Milestone { amount: 600_000_000u128 }],
-    );
+    // Applied, but never approved -- apply_to_pool leaves status "Pending".
     client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
-    client.setup_application_milestones(&pool_id, &student, &milestones);
 
-    let stored = client.get_milestones(&pool_id, &student);
-    assert_eq!(stored, milestones);
+    let milestones = Vec::from_array(&env, [Milestone { amount: 1_000_000_000u128 }]);
+    client.setup_application_milestones(&pool_id, &student, &milestones);
+}
+
+/// Test 8 (Issue #1345, item 2): a student whose application was explicitly
+/// rejected also cannot configure milestones.
+#[test]
+#[should_panic(expected = "Application is not approved")]
+fn test_setup_application_milestones_rejected_application_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[6u8; 32]));
+    let pool_id = client.create_pool_for_school(
+        &creator,
+        &String::from_str(&env, "Milestone Pool"),
+        &String::from_str(&env, "Test"),
+        &1_000_000_000u128,
+        &school,
+        &100_000u64,
+    );
+
+    client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+    client.approve_application(&pool_id, &school, &student, &false);
+
+    let milestones = Vec::from_array(&env, [Milestone { amount: 1_000_000_000u128 }]);
+    client.setup_application_milestones(&pool_id, &student, &milestones);
 }
 
 // ============= ISSUE #940: POOL DEADLINE SETTER/GETTER TESTS =============
@@ -1444,11 +1645,16 @@ fn test_get_milestones_preserves_configured_order() {
 
     let creator = Address::generate(&env);
     let student = Address::generate(&env);
-    let pool_id = client.create_pool(
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[7u8; 32]));
+    let pool_id = client.create_pool_for_school(
         &creator,
         &String::from_str(&env, "Milestone Pool"),
         &String::from_str(&env, "Test"),
         &1_000_000_000u128,
+        &school,
         &100_000u64,
     );
 
@@ -1462,6 +1668,7 @@ fn test_get_milestones_preserves_configured_order() {
         ],
     );
     client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+    client.approve_application(&pool_id, &school, &student, &true);
     client.setup_application_milestones(&pool_id, &student, &milestones);
 
     let stored = client.get_milestones(&pool_id, &student);
@@ -1484,19 +1691,25 @@ fn test_get_milestones_isolated_per_pool_and_student() {
     let creator = Address::generate(&env);
     let student_x = Address::generate(&env);
     let student_y = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[8u8; 32]));
 
-    let pool_a = client.create_pool(
+    let pool_a = client.create_pool_for_school(
         &creator,
         &String::from_str(&env, "Pool A"),
         &String::from_str(&env, "Test"),
         &1_000_000_000u128,
+        &school,
         &100_000u64,
     );
-    let pool_b = client.create_pool(
+    let pool_b = client.create_pool_for_school(
         &creator,
         &String::from_str(&env, "Pool B"),
         &String::from_str(&env, "Test"),
         &1_000_000_000u128,
+        &school,
         &100_000u64,
     );
 
@@ -1512,14 +1725,17 @@ fn test_get_milestones_isolated_per_pool_and_student() {
 
     // (pool_a, student_x)
     client.apply_to_pool(&pool_a, &student_x, &String::from_str(&env, "App"));
+    client.approve_application(&pool_a, &school, &student_x, &true);
     client.setup_application_milestones(&pool_a, &student_x, &milestones_ax);
 
     // (pool_a, student_y) -- same pool, different student
     client.apply_to_pool(&pool_a, &student_y, &String::from_str(&env, "App"));
+    client.approve_application(&pool_a, &school, &student_y, &true);
     client.setup_application_milestones(&pool_a, &student_y, &milestones_ay);
 
     // (pool_b, student_x) -- same student, different pool
     client.apply_to_pool(&pool_b, &student_x, &String::from_str(&env, "App"));
+    client.approve_application(&pool_b, &school, &student_x, &true);
     client.setup_application_milestones(&pool_b, &student_x, &milestones_bx);
 
     // (pool_b, student_y) is left untouched entirely.
@@ -1543,16 +1759,21 @@ fn test_get_milestones_large_list_not_truncated() {
 
     let creator = Address::generate(&env);
     let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let school = Address::generate(&env);
+    client.set_admin(&admin);
+    client.register_school(&school, &BytesN::from_array(&env, &[9u8; 32]));
 
     const COUNT: u32 = 200;
     const PER_MILESTONE: u128 = 5_000_000u128;
     let goal = PER_MILESTONE * (COUNT as u128);
 
-    let pool_id = client.create_pool(
+    let pool_id = client.create_pool_for_school(
         &creator,
         &String::from_str(&env, "Large Milestone Pool"),
         &String::from_str(&env, "Test"),
         &goal,
+        &school,
         &100_000u64,
     );
 
@@ -1562,6 +1783,7 @@ fn test_get_milestones_large_list_not_truncated() {
     }
 
     client.apply_to_pool(&pool_id, &student, &String::from_str(&env, "Application"));
+    client.approve_application(&pool_id, &school, &student, &true);
     client.setup_application_milestones(&pool_id, &student, &milestones);
 
     let stored = client.get_milestones(&pool_id, &student);
@@ -1572,4 +1794,137 @@ fn test_get_milestones_large_list_not_truncated() {
         sum += stored.get(i).unwrap().amount;
     }
     assert_eq!(sum, goal);
+}
+// ============= ISSUE #1309: STATE CONSISTENCY VALIDATION TESTS =============
+
+/// Test 1: After a mix of new and repeat donors, every metric agrees:
+/// collected == sum of per-donor contributions, all total getters match,
+/// and donor count equals the number of distinct donors.
+#[test]
+fn test_pool_metrics_consistent_with_individual_contributions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let donor_a = Address::generate(&env);
+    let donor_b = Address::generate(&env);
+    let donor_c = Address::generate(&env);
+
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Consistency Pool"),
+        &String::from_str(&env, "Test"),
+        &1_000_000_000u128,
+        &100_000u64,
+    );
+
+    client.donate(&pool_id, &donor_a, &10_000_000u128);
+    client.donate(&pool_id, &donor_b, &20_000_000u128);
+    client.donate(&pool_id, &donor_a, &5_000_000u128);
+    client.donate(&pool_id, &donor_c, &7_000_000u128);
+    client.donate(&pool_id, &donor_b, &3_000_000u128);
+
+    let contrib_a = client.get_contribution(&pool_id, &donor_a);
+    let contrib_b = client.get_contribution(&pool_id, &donor_b);
+    let contrib_c = client.get_contribution(&pool_id, &donor_c);
+    assert_eq!(contrib_a, 15_000_000u128);
+    assert_eq!(contrib_b, 23_000_000u128);
+    assert_eq!(contrib_c, 7_000_000u128);
+
+    let sum = contrib_a + contrib_b + contrib_c;
+    assert_eq!(client.get_pool(&pool_id).3, sum);
+    assert_eq!(client.get_total_raised(&pool_id), sum);
+    assert_eq!(client.get_campaign_balance(&pool_id), sum);
+    assert_eq!(client.get_donor_count(&pool_id), 3);
+}
+
+/// Test 2: Disbursing and closing a pool leaves its accounting untouched.
+#[test]
+fn test_close_pool_preserves_contribution_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let donor_a = Address::generate(&env);
+    let donor_b = Address::generate(&env);
+
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Close Invariant Pool"),
+        &String::from_str(&env, "Test"),
+        &1_000_000_000u128,
+        &100_000u64,
+    );
+
+    client.donate(&pool_id, &donor_a, &40_000_000u128);
+    client.donate(&pool_id, &donor_b, &60_000_000u128);
+
+    let collected_before = client.get_total_raised(&pool_id);
+    let donors_before = client.get_donor_count(&pool_id);
+
+    client.set_pool_state(&pool_id, &PoolState::Disbursed);
+    client.close_pool(&pool_id);
+
+    let pool = client.get_pool(&pool_id);
+    assert!(pool.4);
+    assert_eq!(pool.3, collected_before);
+    assert_eq!(client.get_total_raised(&pool_id), collected_before);
+    assert_eq!(client.get_donor_count(&pool_id), donors_before);
+    assert_eq!(client.get_contribution(&pool_id, &donor_a), 40_000_000u128);
+    assert_eq!(client.get_contribution(&pool_id, &donor_b), 60_000_000u128);
+}
+
+/// Test 3: Refunding one donor removes exactly their contribution: their
+/// record is zeroed, the other donor's record is untouched, and collected
+/// still equals the sum of the remaining contribution records.
+#[test]
+fn test_refund_leaves_no_orphaned_contribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // See test_refund_donation_after_grace_period_succeeds for why the TTL is raised.
+    env.ledger().with_mut(|li| {
+        li.min_persistent_entry_ttl = 20_000;
+    });
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let donor_a = Address::generate(&env);
+    let donor_b = Address::generate(&env);
+    let amount_a = 30_000_000u128;
+    let amount_b = 70_000_000u128;
+    let token = create_token(&env, (amount_a + amount_b) as i128, &contract_id);
+
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Refund Consistency Pool"),
+        &String::from_str(&env, "Test"),
+        &1_000_000_000u128,
+        &100_000u64,
+    );
+    client.donate(&pool_id, &donor_a, &amount_a);
+    client.donate(&pool_id, &donor_b, &amount_b);
+
+    let deadline: u32 = 1_000;
+    client.set_pool_deadline(&pool_id, &deadline);
+    env.ledger()
+        .set_sequence_number(deadline + REFUND_GRACE_PERIOD_LEDGERS);
+
+    client.refund_donation(&pool_id, &donor_a, &token);
+
+    assert_eq!(client.get_contribution(&pool_id, &donor_a), 0u128);
+    assert_eq!(client.get_contribution(&pool_id, &donor_b), amount_b);
+
+    let remaining =
+        client.get_contribution(&pool_id, &donor_a) + client.get_contribution(&pool_id, &donor_b);
+    assert_eq!(client.get_total_raised(&pool_id), remaining);
+    assert_eq!(client.get_pool(&pool_id).3, amount_b);
+
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&donor_a), amount_a as i128);
+    assert_eq!(token_client.balance(&contract_id), amount_b as i128);
 }
