@@ -49,6 +49,10 @@ fn seed_application(
         env.storage().persistent().set(
             &claim_key,
             &Application {
+                pool_id,
+                student: student.clone(),
+                application_data: String::from_str(env, "application"),
+                status: String::from_str(env, status),
                 approved_amount,
                 amount_claimed,
             },

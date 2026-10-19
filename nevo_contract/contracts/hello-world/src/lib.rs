@@ -20,8 +20,8 @@
 #![cfg_attr(not(test), no_std)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN,
-    Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    String, Symbol, Vec,
 };
 
 // Storage key constants
@@ -136,8 +136,10 @@ pub enum ContractError {
     InvalidPoolName = 16,
     /// Pool funding goal is zero.
     InvalidPoolTarget = 17,
-    /// Pool application deadline is already in the past.
+    /// Pool application deadline is zero or already in the past.
     InvalidPoolDeadline = 18,
+    /// Donation attempted at or after the pool's application deadline.
+    CampaignExpired = 19,
 }
 
 // Helper functions for timestamp/deadline edge-case tests
@@ -191,6 +193,10 @@ pub fn set_deadline(deadline: u64) -> Result<(), &'static str> {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Application {
+    pub pool_id: u32,
+    pub student: Address,
+    pub application_data: String,
+    pub status: String,
     /// The total amount the student is approved to receive from this pool.
     pub approved_amount: i128,
     /// Running total of funds already disbursed to the student.
@@ -309,7 +315,7 @@ impl Contract {
             .storage()
             .persistent()
             .get::<_, Address>(&admin_key)
-            .expect("Admin not set");
+            .unwrap_or_else(|| env.panic_with_error(ContractError::AdminNotSet));
 
         // Enforce root protocol admin authorization.
         admin.require_auth();
@@ -333,7 +339,7 @@ impl Contract {
         env.storage()
             .persistent()
             .get::<_, BytesN<32>>(&school_key)
-            .expect("School not registered")
+            .unwrap_or_else(|| env.panic_with_error(ContractError::SchoolNotRegistered))
     }
 
     // ─── Pool Management ─────────────────────────────────────────────────────
@@ -365,8 +371,11 @@ impl Contract {
         if description.len() as u32 > MAX_DESCRIPTION_LENGTH as u32 {
             panic!("Description exceeds maximum length");
         }
+        if goal == 0 {
+            env.panic_with_error(ContractError::InvalidPoolTarget);
+        }
         if application_deadline == 0 {
-            panic!("Duration must be greater than zero");
+            env.panic_with_error(ContractError::InvalidPoolDeadline);
         }
 
         let pool_count_key = Symbol::new(&env, POOL_COUNT);
@@ -551,6 +560,10 @@ impl Contract {
         // Pool state validation
         if pool.state != PoolState::Active {
             env.panic_with_error(ContractError::InvalidPoolState);
+        }
+
+        if env.ledger().timestamp() >= pool.application_deadline {
+            env.panic_with_error(ContractError::CampaignExpired);
         }
 
         let new_collected = pool.collected + amount;
@@ -743,12 +756,11 @@ impl Contract {
 
     /// Get the number of unique donors for a pool.
     pub fn get_donor_count(env: Env, pool_id: u32) -> u32 {
-        // Verify the pool exists first
-        let _pool: Pool = env
-            .storage()
-            .persistent()
-            .get::<_, Pool>(&pool_id)
-            .unwrap_or_else(|| env.panic_with_error(ContractError::PoolNotFound));
+        // Verify the pool exists first (issue #1482: an existence check is
+        // enough here, a full Pool read is not required).
+        if !env.storage().persistent().has(&pool_id) {
+            env.panic_with_error(ContractError::PoolNotFound);
+        }
 
         env.storage()
             .persistent()
@@ -758,12 +770,11 @@ impl Contract {
 
     /// Get the total contribution of a specific donor to a specific pool.
     pub fn get_contribution(env: Env, pool_id: u32, donor: Address) -> u128 {
-        // Verify the pool exists first
-        let _pool: Pool = env
-            .storage()
-            .persistent()
-            .get::<_, Pool>(&pool_id)
-            .unwrap_or_else(|| env.panic_with_error(ContractError::PoolNotFound));
+        // Verify the pool exists first (issue #1482: an existence check is
+        // enough here, a full Pool read is not required).
+        if !env.storage().persistent().has(&pool_id) {
+            env.panic_with_error(ContractError::PoolNotFound);
+        }
 
         env.storage()
             .persistent()
@@ -799,15 +810,38 @@ impl Contract {
         app_count += 1;
 
         let app_key = (Symbol::new(&env, APPLICATION_PREFIX), pool_id, app_count);
-        env.storage()
-            .persistent()
-            .set(&app_key, &(app_count, student.clone(), application_data));
+        env.storage().persistent().set(
+            &app_key,
+            &(app_count, student.clone(), application_data.clone()),
+        );
+
+        let application_key = (
+            Symbol::new(&env, CLAIMED_AMOUNT_PREFIX),
+            pool_id,
+            student.clone(),
+        );
+        env.storage().persistent().set(
+            &application_key,
+            &Application {
+                pool_id,
+                student: student.clone(),
+                application_data,
+                status: String::from_str(&env, "Pending"),
+                approved_amount: 0,
+                amount_claimed: 0,
+            },
+        );
 
         env.storage().persistent().set(&applicant_key, &true);
         env.storage().persistent().set(&count_key, &app_count);
 
         let pending = String::from_str(&env, "Pending");
-        Self::set_application_status(env.clone(), pool_id, student.clone(), pending);
+        let status_key = (
+            Symbol::new(&env, APPLICATION_STATUS_PREFIX),
+            pool_id,
+            student.clone(),
+        );
+        env.storage().persistent().set(&status_key, &pending);
 
         // Emit application/contribution event with privacy flag (default: false for public)
         env.events().publish(
@@ -817,6 +851,17 @@ impl Contract {
     }
 
     /// School approves or rejects a student's application.
+    ///
+    /// Requires authorization from `school` (`school.require_auth()`), and
+    /// `school` must be the school linked to the pool. Sets the application
+    /// status to approved or rejected according to `approved` and emits an
+    /// `app_aprvd` event.
+    ///
+    /// # Panics
+    /// - `ContractError::OnlyLinkedSchoolCanApprove` if `school` is not the
+    ///   school linked to the pool
+    /// - `ContractError::StudentHasNotApplied` if the student never applied
+    ///   to the pool
     pub fn approve_application(
         env: Env,
         pool_id: u32,
@@ -845,7 +890,7 @@ impl Contract {
         } else {
             String::from_str(&env, APPLICATION_STATUS_REJECTED)
         };
-        Self::set_application_status(env.clone(), pool_id, student.clone(), status);
+        Self::set_application_status(env.clone(), school.clone(), pool_id, student.clone(), status);
 
         // Issue #954: emit application-approved event
         env.events()
@@ -853,6 +898,12 @@ impl Contract {
     }
 
     /// Set application milestones and enforce sum(amounts) == pool goal.
+    ///
+    /// # Panics
+    /// - `ContractError::PoolNotFound` if pool_id is invalid
+    /// - `ContractError::StudentHasNotApplied` if the student never applied
+    /// - `"Application is not approved"` if the application has not been
+    ///   approved via `approve_application` (Issue #1345)
     pub fn setup_application_milestones(
         env: Env,
         pool_id: u32,
@@ -876,6 +927,13 @@ impl Contract {
             env.panic_with_error(ContractError::StudentHasNotApplied);
         }
 
+        // Issue #1345: milestones may only be configured for an approved
+        // application. Mirrors the same check already enforced by claim_funds.
+        let status = Self::get_application_status(env.clone(), pool_id, student.clone());
+        if status != String::from_str(&env, APPLICATION_STATUS_APPROVED) {
+            panic!("Application is not approved");
+        }
+
         if milestones.is_empty() {
             panic!("Milestones required");
         }
@@ -891,12 +949,18 @@ impl Contract {
             panic!("Milestone total must equal pool goal");
         }
 
-        let milestones_key = (Symbol::new(&env, MILESTONES_PREFIX), pool_id, student.clone());
+        let milestones_key = (
+            Symbol::new(&env, MILESTONES_PREFIX),
+            pool_id,
+            student.clone(),
+        );
         env.storage().persistent().set(&milestones_key, &milestones);
 
         // Issue #954: emit milestones-set event
-        env.events()
-            .publish((MILESTONES_SET, pool_id), (student.clone(), milestones.len()));
+        env.events().publish(
+            (MILESTONES_SET, pool_id),
+            (student.clone(), milestones.len()),
+        );
     }
 
     /// Get student milestones for a pool.
@@ -909,13 +973,48 @@ impl Contract {
     }
 
     /// Set application status for a student in a pool.
-    pub fn set_application_status(env: Env, pool_id: u32, student: Address, status: String) {
+    pub fn set_application_status(
+        env: Env,
+        caller: Address,
+        pool_id: u32,
+        student: Address,
+        status: String,
+    ) {
+        caller.require_auth();
+        let linked_school = Self::get_pool_school(env.clone(), pool_id);
+        let admin_key = Symbol::new(&env, ADMIN_KEY);
+        let is_admin = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&admin_key)
+            .map(|a| a == caller)
+            .unwrap_or(false);
+
+        if caller != linked_school && !is_admin {
+            env.panic_with_error(ContractError::UnauthorizedAdmin);
+        }
         let status_key = (
             Symbol::new(&env, APPLICATION_STATUS_PREFIX),
             pool_id,
             student.clone(),
         );
         env.storage().persistent().set(&status_key, &status);
+
+        let application_key = (
+            Symbol::new(&env, CLAIMED_AMOUNT_PREFIX),
+            pool_id,
+            student,
+        );
+        if let Some(mut application) = env
+            .storage()
+            .persistent()
+            .get::<_, Application>(&application_key)
+        {
+            application.status = status;
+            env.storage()
+                .persistent()
+                .set(&application_key, &application);
+        }
     }
 
     /// Get application status for a student in a pool.
@@ -953,7 +1052,7 @@ impl Contract {
     }
 
     /// Get the full Application record for a student in a pool.
-    /// Returns `None` if the student has not yet made any claim.
+    /// Returns `None` if the student has not applied to the pool.
     pub fn get_application(env: Env, pool_id: u32, student: Address) -> Option<Application> {
         let app_key = (
             Symbol::new(&env, CLAIMED_AMOUNT_PREFIX),
@@ -1032,6 +1131,10 @@ impl Contract {
                         .persistent()
                         .get::<_, Application>(&claim_key)
                         .unwrap_or(Application {
+                            pool_id,
+                            student: student.clone(),
+                            application_data: String::from_str(&env, ""),
+                            status: status.clone(),
                             approved_amount: 0,
                             amount_claimed: 0,
                         });
@@ -1136,9 +1239,17 @@ impl Contract {
             .persistent()
             .get::<_, Application>(&app_key)
             .unwrap_or(Application {
+                pool_id,
+                student: student.clone(),
+                application_data: String::from_str(&env, ""),
+                status: Self::get_application_status(env.clone(), pool_id, student.clone()),
                 approved_amount: collected,
                 amount_claimed: 0,
             });
+
+        if application.approved_amount == 0 {
+            application.approved_amount = collected;
+        }
 
         // Enforce the partial-payment invariant
         if application.amount_claimed + claim_amount > collected {
@@ -1222,8 +1333,7 @@ impl Contract {
         env.storage().persistent().set(&unclaimed_fees_key, &0i128);
 
         // Issue #954: emit fees-claimed event
-        env.events()
-            .publish((FEES_CLAIMED, admin.clone()), (fees,));
+        env.events().publish((FEES_CLAIMED, admin.clone()), (fees,));
 
         fees
     }
@@ -1239,7 +1349,7 @@ impl Contract {
     /// Emits a `creation_fee_updated` event on success.
     ///
     /// # Panics
-    /// - `"Admin not set"` if no admin has been configured
+    /// - `ContractError::AdminNotSet` if no admin has been configured
     /// - `"Unauthorized admin"` if `admin` does not match the stored admin
     /// - `"InvalidFee"` if `fee` is negative
     /// A negative fee panics with `ContractError::InvalidFee`.
@@ -1273,10 +1383,8 @@ impl Contract {
         // Issue #954: use shared FEE_UPDATED constant instead of inline Symbol::new
         env.events().publish((FEE_UPDATED,), fee);
         // Emit event: topics = ["creation_fee_updated"], data = new fee value
-        env.events().publish(
-            (Symbol::new(&env, "creation_fee_updated"),),
-            fee,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "creation_fee_updated"),), fee);
     }
 
     /// Get the current pool creation fee.
@@ -1297,7 +1405,6 @@ impl Contract {
     /// The deadline must be in the future (greater than the current ledger).
     ///
     /// # Panics
-    /// - `"Pool not found"` if pool_id is invalid
     /// - `ContractError::PoolNotFound` if pool_id is invalid
     /// - `"Error(Auth, InvalidAction)"` if caller is not the pool sponsor
     /// - `"Deadline must be in the future"` if deadline <= current ledger
@@ -1306,7 +1413,7 @@ impl Contract {
             .storage()
             .persistent()
             .get::<_, Pool>(&pool_id)
-            .expect("Pool not found");
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PoolNotFound));
 
         pool.sponsor.require_auth();
 
@@ -1372,11 +1479,7 @@ impl Contract {
         }
 
         let token_key = (Symbol::new(&env, POOL_TOKEN_PREFIX), pool_id);
-        if let Some(expected_token) = env
-            .storage()
-            .persistent()
-            .get::<_, Address>(&token_key)
-        {
+        if let Some(expected_token) = env.storage().persistent().get::<_, Address>(&token_key) {
             if expected_token != token_address {
                 panic!("TokenTransferFailed");
             }
@@ -1438,16 +1541,16 @@ impl Contract {
             env.panic_with_error(ContractError::InvalidPoolState);
         }
 
+        if env.ledger().timestamp() >= pool.application_deadline {
+            env.panic_with_error(ContractError::CampaignExpired);
+        }
+
         if amount <= 0 {
             panic!("InvalidAmount");
         }
 
         let token_key = (Symbol::new(&env, POOL_TOKEN_PREFIX), pool_id);
-        if let Some(expected_token) = env
-            .storage()
-            .persistent()
-            .get::<_, Address>(&token_key)
-        {
+        if let Some(expected_token) = env.storage().persistent().get::<_, Address>(&token_key) {
             if expected_token != token_address {
                 panic!("TokenTransferFailed");
             }
@@ -1503,7 +1606,7 @@ impl Contract {
     ///
     /// # Panics
     /// - `ContractError::AdminNotSet` if no admin has been configured
-    /// - `"Error(Auth, InvalidAction)"` if the caller is not the stored admin
+    /// - `ContractError::UnauthorizedAdmin` if the caller is not the stored admin
     /// - `ContractError::PoolNotFound` if the pool does not exist
     /// - `ContractError::PoolIsClosed` if the pool is closed
     /// - `ContractError::InvalidPoolState` if the pool is not `Active`
@@ -1524,7 +1627,7 @@ impl Contract {
             .get::<_, Address>(&admin_key)
             .unwrap_or_else(|| env.panic_with_error(ContractError::AdminNotSet));
         if stored_admin != admin {
-            panic!("Error(Auth, InvalidAction)");
+            env.panic_with_error(ContractError::UnauthorizedAdmin);
         }
 
         let pool: Pool = env
@@ -1676,14 +1779,7 @@ impl Contract {
             env.events().publish((FEE_PAID,), (creator.clone(), fee));
         }
 
-        Self::create_pool(
-            env,
-            creator,
-            title,
-            description,
-            goal,
-            application_deadline,
-        )
+        Self::create_pool(env, creator, title, description, goal, application_deadline)
     }
 
     /// Alias for `create_pool_with_fee`.
@@ -1737,14 +1833,26 @@ impl Contract {
         env.storage().persistent().set(&token_key, &token);
 
         // Emit events
-        env.events().publish((CROWDFUNDING_TOKEN_SET,), token.clone());
-        env.events().publish(
-            (Symbol::new(&env, "crowdfunding_token_set"), admin),
-            token,
-        );
+        env.events()
+            .publish((CROWDFUNDING_TOKEN_SET,), token.clone());
+        env.events()
+            .publish((Symbol::new(&env, "crowdfunding_token_set"), admin), token);
     }
 
     /// Get the currently configured global crowdfunding token.
+    ///
+    /// # Panics
+    /// - `"Crowdfunding token not set"` if `set_crowdfunding_token` has never
+    ///   succeeded. This is a plain `.expect()` panic, unlike the typed
+    ///   `ContractError::AdminNotSet` used by `set_crowdfunding_token` for its
+    ///   own admin lookup.
+    ///
+    /// Follow-up (issue #1483): replace the `.expect()` with a typed
+    /// `ContractError` variant, consistent with `ContractError::AdminNotSet`
+    /// and `ContractError::SchoolNotRegistered`, and document the new code in
+    /// `nevo_contract/ERRORS.md`. The panic text is locked in by
+    /// `test_issue_1483_crowdfunding_token_unset` so that change has to be
+    /// deliberate.
     pub fn get_crowdfunding_token(env: Env) -> Address {
         let token_key = Symbol::new(&env, CROWDFUNDING_TOKEN_KEY);
         env.storage()
@@ -1752,14 +1860,43 @@ impl Contract {
             .get::<_, Address>(&token_key)
             .expect("Crowdfunding token not set")
     }
+
+    /// Return the number of ledgers a donor must wait after a pool's deadline
+    /// before `refund_donation()` will succeed.
+    ///
+    /// This corresponds to the compile-time constant `REFUND_GRACE_PERIOD_LEDGERS`
+    /// (currently 17 280 ledgers, ≈ 24 hours at a 5-second ledger cadence).
+    /// Off-chain integrators should call this getter rather than hard-coding the
+    /// value so they remain correct if the constant is ever updated.
+    pub fn get_refund_grace_period_ledgers(_env: Env) -> u32 {
+        REFUND_GRACE_PERIOD_LEDGERS
+    }
+
+    /// Return the number of seconds an admin must wait after
+    /// `request_emergency_withdraw()` before `execute_emergency_withdraw()`
+    /// will succeed.
+    ///
+    /// This corresponds to the compile-time constant `GRACE_PERIOD_SECS`
+    /// (currently 86 400 seconds, i.e. 24 hours). Off-chain integrators
+    /// should call this getter rather than hard-coding the value so they
+    /// remain correct if the constant is ever updated.
+    pub fn get_emergency_grace_period_secs(_env: Env) -> u64 {
+        GRACE_PERIOD_SECS
+    }
 }
 
 mod test;
-mod test_issues;
-mod test_register_school;
+mod test_campaign_lifecycle;
 mod test_contract_initialization;
+mod test_issue_1287_pool_multisig;
+mod test_issue_1319_memory;
+mod test_issue_1482_pool_getter_missing_pool;
+mod test_issue_1483_crowdfunding_token_unset;
+mod test_issue_1484_create_campaign_with_fee;
+mod test_issue_1485_campaign_balance_alias;
+mod test_issue_1487_emergency_withdraw_amount_validation;
+mod test_issues;
 mod test_pool_creation;
 mod test_pool_retrieval;
-mod test_campaign_lifecycle;
+mod test_register_school;
 mod test_withdraw;
-mod test_issue_1287_pool_multisig;
